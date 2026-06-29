@@ -1,6 +1,5 @@
 ﻿from typing import Any, Callable, Union, Awaitable
 
-from pydantic import BaseModel
 from docstring_parser import parse as _parse_docstring
 from typing import Literal, get_args, get_origin, get_type_hints
 import sys
@@ -26,8 +25,8 @@ def _parse_param_docs(fn: AsyncOrSyncFunction) -> dict[str, str]:
 
 def _get_union_args(annotation: Any) -> tuple[Any, ...] | None:
     """
-    Р’РѕР·РІСЂР°С‰Р°РµС‚ Р°СЂРіСѓРјРµРЅС‚С‹ Union/Optional/X|Y, Р»РёР±Рѕ None РµСЃР»Рё РЅРµ Union.
-    РџРѕРєСЂС‹РІР°РµС‚ typing.Union Рё types.UnionType (Python 3.10+ pipe syntax).
+    Returns Union/Optional/X|Y arguments, or None if not a Union.
+    Handles typing.Union and types.UnionType (Python 3.10+ pipe syntax).
     """
     if get_origin(annotation) is Union:
         return get_args(annotation)
@@ -39,7 +38,7 @@ def _get_union_args(annotation: Any) -> tuple[Any, ...] | None:
 
 
 def _annotation_to_schema(annotation: Any) -> dict[str, Any]:
-    # empty / Any - Р±РµР· РѕРіСЂР°РЅРёС‡РµРЅРёР№
+    # empty / Any - no constraints
     if annotation is inspect.Parameter.empty or annotation is Any:
         return {}
 
@@ -57,7 +56,7 @@ def _annotation_to_schema(annotation: Any) -> dict[str, Any]:
         non_null = [s for s in arg_schemas if s != null_schema]
 
         if len(arg_schemas) == 2 and null_schema in arg_schemas:
-            # Optional[X] / X | None - РґРµСЂР¶РёРј РїР»РѕСЃРєСѓСЋ СЃС‚СЂСѓРєС‚СѓСЂСѓ
+            # Optional[X] / X | None - keep flat structure
             return {'anyOf': [non_null[0], null_schema]}
         return {'anyOf': arg_schemas}
 
@@ -80,9 +79,9 @@ def _annotation_to_schema(annotation: Any) -> dict[str, Any]:
         if not args:
             return {'type': 'array'}
         if len(args) == 2 and args[1] is Ellipsis:
-            # tuple[int, ...] - РїРµСЂРµРјРµРЅРЅР°СЏ РґР»РёРЅР°
+            # tuple[int, ...] - variable length
             return {'type': 'array', 'items': _annotation_to_schema(args[0])}
-        # tuple[int, str, float] - С„РёРєСЃРёСЂРѕРІР°РЅРЅР°СЏ СЃС‚СЂСѓРєС‚СѓСЂР°
+        # tuple[int, str, float] - fixed structure
         return {
             'type': 'array',
             'prefixItems': [_annotation_to_schema(a) for a in args],
@@ -99,8 +98,9 @@ def _annotation_to_schema(annotation: Any) -> dict[str, Any]:
                 schema['additionalProperties'] = val_schema
         return schema
 
-    # Pydantic BaseModel - РІР»РѕР¶РµРЅРЅР°СЏ СЃС…РµРјР°
+    # Pydantic BaseModel - nested schema
     try:
+        from pydantic import BaseModel
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             return annotation.model_json_schema()
     except ImportError:
@@ -112,20 +112,20 @@ def _annotation_to_schema(annotation: Any) -> dict[str, Any]:
 def _is_optional_param(annotation: Any, default: Any) -> bool:
     if default is not inspect.Parameter.empty:
         return True
-    origin = typing.get_origin(annotation)
-    return _is_union(origin) and type(None) in typing.get_args(annotation)
+    origin = get_origin(annotation)
+    return get_origin(origin) is Union and type(None) in get_args(annotation)
 
 
 def _make_strict_schema(base: dict[str, Any]) -> dict[str, Any]:
     """
-    Р’ strict mode РїР°СЂР°РјРµС‚СЂ СЃ РґРµС„РѕР»С‚РѕРј РґРѕР»Р¶РµРЅ РїСЂРёРЅРёРјР°С‚СЊ null
-    (LLM РїРµСЂРµРґР°СЃС‚ null РІРјРµСЃС‚Рѕ РїСЂРѕРїСѓСЃРєР° Р°СЂРіСѓРјРµРЅС‚Р°).
-    Р•СЃР»Рё СЃС…РµРјР° СѓР¶Рµ anyOf СЃ null вЂ” РЅРµ РґСѓР±Р»РёСЂСѓРµРј.
+    In strict mode, a parameter with a default must accept null
+    (the LLM will pass null instead of omitting the argument).
+    If the schema already has anyOf with null, do not duplicate.
     """
     null_schema = {'type': 'null'}
     if not base:
         return null_schema
-    # СѓР¶Рµ nullable
+    # already nullable
     if 'anyOf' in base and null_schema in base['anyOf']:
         return base
     return {'anyOf': [base, null_schema]}
@@ -137,7 +137,7 @@ def build_json_schema(fn: AsyncOrSyncFunction) -> dict[str, Any]:
     param_docs = _parse_param_docs(fn)
 
     properties: dict[str, Any] = {}
-    required: list[str] = []  # РІ strict mode вЂ” РІСЃРµ РїР°СЂР°РјРµС‚СЂС‹
+    required: list[str] = []  # in strict mode — all parameters
 
     for name, param in sig.parameters.items():
         if name in ('self', 'cls'):
@@ -147,7 +147,7 @@ def build_json_schema(fn: AsyncOrSyncFunction) -> dict[str, Any]:
         has_default = param.default is not inspect.Parameter.empty
         base_schema = _annotation_to_schema(annotation)
 
-        # optional - anyOf [type, null] С‡С‚РѕР±С‹ LLM РјРѕРіР»Р° СЏРІРЅРѕ РїРµСЂРµРґР°С‚СЊ null
+        # optional - anyOf [type, null] so the LLM can explicitly pass null
         if has_default:
             prop = _make_strict_schema(base_schema)
         else:
@@ -157,7 +157,7 @@ def build_json_schema(fn: AsyncOrSyncFunction) -> dict[str, Any]:
             prop['description'] = description
 
         properties[name] = prop
-        required.append(name)  # РІСЃРµРіРґР°
+        required.append(name)  # always
 
     description = (inspect.getdoc(fn) or '').replace('\n', ' ').strip()
 
@@ -173,4 +173,3 @@ def build_json_schema(fn: AsyncOrSyncFunction) -> dict[str, Any]:
             'required': required,
         },
     }
-
