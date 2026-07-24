@@ -34,6 +34,20 @@ def _get_union_args(annotation: Any) -> tuple[Any, ...] | None:
     return None
 
 
+def _literal_json_type(value: Any) -> str | None:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return None
+
+
 def _annotation_to_schema(annotation: Any, _seen: set | None = None) -> dict[str, Any]:
     if _seen is None:
         _seen = set()
@@ -93,7 +107,27 @@ def _annotation_to_schema(annotation: Any, _seen: set | None = None) -> dict[str
 
     # Literal["a", "b"]
     if origin is Literal:
-        return {'enum': list(args)}
+        values = list(args)
+        types = {
+            json_type
+            for value in values
+            if (json_type := _literal_json_type(value)) is not None
+        }
+        if types <= {"integer", "number"} and types:
+            return {
+                "type": "number" if "number" in types else "integer",
+                "enum": values,
+            }
+        if len(types) == 1:
+            return {
+                "type": next(iter(types)),
+                "enum": values,
+            }
+        if types:
+            return {
+                "anyOf": [{"type": json_type} for json_type in sorted(types)],
+                "enum": values,
+            }
 
     # list[X]
     if origin is list:
